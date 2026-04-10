@@ -44,6 +44,13 @@
       color: #777;
       font-style: italic;
     }
+    input[type="file"] {
+      flex: 1;
+      padding: 6px 10px;
+    }
+    #sendFileBtn {
+      white-space: nowrap;
+    }
   </style>
 </head>
 <body>
@@ -60,6 +67,11 @@
   <div class="row">
     <input id="messageInput" type="text" placeholder="Type a message" disabled />
     <button id="sendBtn" disabled>Send</button>
+  </div>
+
+  <div class="row">
+    <input type="file" id="fileInput" disabled />
+    <button id="sendFileBtn" disabled>Send File</button>
   </div>
 
   <script src="index.js"></script>
