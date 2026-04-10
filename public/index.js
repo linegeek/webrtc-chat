@@ -1,3 +1,8 @@
+// native-file-system-adapter: ponyfill for showSaveFilePicker that works in
+// Chrome/Edge (native FSAPI), Firefox/Safari (service-worker stream), and
+// any browser as a last resort (constructing-blob / in-memory).
+import { showSaveFilePicker } from "https://cdn.jsdelivr.net/npm/native-file-system-adapter/mod.js";
+
 const statusEl = document.getElementById("status");
 const messagesEl = document.getElementById("messages");
 const roomInput = document.getElementById("roomInput");
@@ -12,13 +17,26 @@ let pc;
 let dataChannel;
 let isInitiator = false;
 
-// File transfer state (receiver side)
-let incomingFileMeta = null;
-let incomingChunks = [];
-let incomingBytesReceived = 0;
-let lastLoggedReceivePercent = 0;
+// ── File transfer: sender state ────────────────────────────────────────────────
+// Resolved/rejected when the receiver accepts or declines the file offer.
+let pendingFileAcceptResolve = null;
+let pendingFileAcceptReject  = null;
 
-const CHUNK_SIZE = 64 * 1024; // 64 KB per chunk
+// ── File transfer: receiver state ─────────────────────────────────────────────
+let incomingFileMeta          = null;  // metadata for the in-progress receive
+let incomingWritable          = null;  // FSAPI WritableStream (streaming-to-disk path)
+let incomingChunks            = [];    // in-memory fallback chunk accumulator
+let incomingBytesReceived     = 0;
+let useStreamingSave          = false; // true when FSAPI writable is open
+
+// ── Progress bar state ────────────────────────────────────────────────────────
+let transferStartTime  = 0;  // Date.now() when the active transfer began
+let lastProgressUpdate = 0;  // Date.now() of the last DOM update (throttle)
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+const CHUNK_SIZE          = 64  * 1024;        // 64 KB — safe for all browsers
+const BUFFER_HIGH_THRESHOLD = 4  * 1024 * 1024; // pause sending above 4 MB buffered
+const BUFFER_LOW_THRESHOLD  = 1  * 1024 * 1024; // resume sending below 1 MB buffered
 
 const rtcConfig = {
   iceServers: [
@@ -26,58 +44,20 @@ const rtcConfig = {
   ]
 };
 
+// Register the self-hosted service worker that native-file-system-adapter
+// uses to stream large files directly to disk in browsers without the native
+// File System Access API (e.g. Firefox, Safari).
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("/sw.js").catch((err) => {
+    console.warn("SW registration failed — streaming fallback may buffer in RAM:", err);
+  });
+}
+
 function formatSize(bytes) {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-async function compressData(arrayBuffer) {
-  const stream = new CompressionStream("gzip");
-  const writer = stream.writable.getWriter();
-  writer.write(arrayBuffer);
-  writer.close();
-
-  const chunks = [];
-  const reader = stream.readable.getReader();
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-  }
-
-  const totalLength = chunks.reduce((sum, c) => sum + c.byteLength, 0);
-  const result = new Uint8Array(totalLength);
-  let offset = 0;
-  for (const chunk of chunks) {
-    result.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return result.buffer;
-}
-
-async function decompressData(arrayBuffer) {
-  const stream = new DecompressionStream("gzip");
-  const writer = stream.writable.getWriter();
-  writer.write(arrayBuffer);
-  writer.close();
-
-  const chunks = [];
-  const reader = stream.readable.getReader();
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-  }
-
-  const totalLength = chunks.reduce((sum, c) => sum + c.byteLength, 0);
-  const result = new Uint8Array(totalLength);
-  let offset = 0;
-  for (const chunk of chunks) {
-    result.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return result.buffer;
+  if (bytes < 1024)                  return `${bytes} B`;
+  if (bytes < 1024 * 1024)           return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024)    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
 function logMessage(text, type = "system") {
@@ -137,40 +117,57 @@ function setupDataChannel() {
 
   dataChannel.onmessage = (event) => {
     if (typeof event.data === "string") {
-      // Try to parse as file metadata first
       let parsed = null;
       try { parsed = JSON.parse(event.data); } catch (_) {}
 
       if (parsed && parsed.type === "file-meta") {
-        // Start of an incoming file transfer
-        incomingFileMeta = parsed;
-        incomingChunks = [];
+        // ── Incoming file offer ──────────────────────────────────────────────
+        incomingFileMeta      = parsed;
         incomingBytesReceived = 0;
-        lastLoggedReceivePercent = 0;
-        logMessage(
-          `📥 Incoming file: "${parsed.filename}" (${formatSize(parsed.compressedSize)} compressed)`,
-          "system"
-        );
+        incomingChunks        = [];
+        incomingWritable      = null;
+        useStreamingSave      = false;
+        showIncomingFileUI(parsed);
+
+      } else if (parsed && parsed.type === "file-accept") {
+        // ── Peer accepted our file offer — start streaming ───────────────────
+        if (pendingFileAcceptResolve) {
+          pendingFileAcceptResolve();
+          pendingFileAcceptResolve = null;
+          pendingFileAcceptReject  = null;
+        }
+
+      } else if (parsed && parsed.type === "file-cancel") {
+        // ── Peer declined our file offer ─────────────────────────────────────
+        if (pendingFileAcceptReject) {
+          pendingFileAcceptReject(new Error("Peer declined the file transfer"));
+          pendingFileAcceptResolve = null;
+          pendingFileAcceptReject  = null;
+        }
+
       } else {
         // Plain text chat message
         logMessage(`Peer: ${event.data}`, "peer");
       }
+
     } else if (event.data instanceof ArrayBuffer) {
-      // Binary chunk belonging to the current file transfer
+      // ── Binary chunk for the active incoming transfer ────────────────────
       if (!incomingFileMeta) return;
 
-      incomingChunks.push(event.data);
       incomingBytesReceived += event.data.byteLength;
 
-      // Log progress at 25 % milestones
-      const progress = Math.floor((incomingBytesReceived / incomingFileMeta.compressedSize) * 100);
-      const milestone = Math.floor(progress / 25) * 25;
-      if (milestone > lastLoggedReceivePercent && milestone < 100) {
-        logMessage(`Receiving "${incomingFileMeta.filename}": ${milestone}%`, "system");
-        lastLoggedReceivePercent = milestone;
+      if (useStreamingSave && incomingWritable) {
+        // Always pass Uint8Array: FSAPI accepts it, StreamSaver requires it.
+        incomingWritable.write(new Uint8Array(event.data)).catch((err) => {
+          logMessage(`❌ Disk write error: ${err.message}`, "system");
+        });
+      } else {
+        incomingChunks.push(event.data);
       }
 
-      if (incomingBytesReceived >= incomingFileMeta.compressedSize) {
+      updateTransferProgress(incomingBytesReceived, incomingFileMeta.size);
+
+      if (incomingBytesReceived >= incomingFileMeta.size) {
         receiveFile();
       }
     }
@@ -182,115 +179,232 @@ function setupDataChannel() {
   };
 }
 
-async function receiveFile() {
-  // Snapshot and immediately clear state so a new transfer can start
-  const meta = incomingFileMeta;
-  const chunks = incomingChunks;
-  incomingFileMeta = null;
-  incomingChunks = [];
-  incomingBytesReceived = 0;
-  lastLoggedReceivePercent = 0;
+// ── showIncomingFileUI / hideIncomingFileUI ────────────────────────────────────
+function showIncomingFileUI(meta) {
+  document.getElementById("incomingFileInfo").textContent =
+    `📥 Incoming file: "${meta.filename}" (${formatSize(meta.size)})`;
+  document.getElementById("incomingFileUI").style.display = "block";
+}
+
+function hideIncomingFileUI() {
+  document.getElementById("incomingFileUI").style.display = "none";
+}
+
+// ── Transfer progress bar ─────────────────────────────────────────────────────
+const progressEl     = document.getElementById("transferProgress");
+const progressLabel  = document.getElementById("transferProgressLabel");
+const progressBar    = document.getElementById("transferProgressBar");
+const progressText   = document.getElementById("transferProgressText");
+
+function showTransferProgress(direction, filename, total) {
+  progressLabel.textContent = `${direction === "send" ? "📤 Sending" : "📥 Receiving"} "${filename}"`;
+  progressBar.value         = 0;
+  progressBar.max           = total;
+  progressText.textContent  = `0% · 0 B of ${formatSize(total)}`;
+  progressEl.style.display  = "block";
+  transferStartTime  = Date.now();
+  lastProgressUpdate = 0;
+}
+
+// Throttled to at most one DOM update every 250 ms (safe for 64 KB × 80 000 chunks).
+// The final chunk (loaded === total) always updates immediately.
+function updateTransferProgress(loaded, total) {
+  const now = Date.now();
+  if (now - lastProgressUpdate < 250 && loaded < total) return;
+  lastProgressUpdate = now;
+
+  const pct     = total > 0 ? Math.floor((loaded / total) * 100) : 0;
+  const elapsed = (now - transferStartTime) / 1000;          // seconds
+  const speed   = elapsed > 0.5 ? loaded / elapsed : 0;      // avg bytes/s (stable after 0.5 s)
+
+  progressBar.value        = loaded;
+  progressText.textContent = `${pct}% · ${formatSize(loaded)} of ${formatSize(total)}` +
+    (speed > 0 ? ` · ${formatSize(Math.round(speed))}/s` : "");
+}
+
+function hideTransferProgress() {
+  progressEl.style.display = "none";
+}
+
+// ── acceptIncomingFile — called by the "Accept & Save" button ─────────────────
+// Uses native-file-system-adapter's showSaveFilePicker ponyfill, which
+// automatically selects the best available method in priority order:
+//
+//   1. 'native'                — native File System Access API (Chrome/Edge 86+)
+//                                User picks a save location via OS dialog.
+//   2. 'sw-transferable-stream'— our self-hosted sw.js intercepts a fetch and
+//      'sw-message-channel'      pipes chunks straight to the browser download
+//                                manager (Firefox, Safari, older Chrome).
+//                                Streams to disk with no RAM accumulation.
+//
+// 'constructing-blob' is intentionally excluded — it buffers everything in RAM,
+// which defeats the purpose for large files.  If even the SW methods are
+// unavailable, we catch the error and fall back to our own in-memory path with
+// a warning.
+async function acceptIncomingFile() {
+  if (!incomingFileMeta) return;
+  hideIncomingFileUI();
 
   try {
-    // Merge all received chunks into one contiguous buffer
-    const totalLength = chunks.reduce((sum, c) => sum + c.byteLength, 0);
-    const merged = new Uint8Array(totalLength);
-    let offset = 0;
-    for (const chunk of chunks) {
-      merged.set(new Uint8Array(chunk), offset);
-      offset += chunk.byteLength;
-    }
-
-    logMessage(`Decompressing "${meta.filename}"...`, "system");
-    const decompressed = await decompressData(merged.buffer);
-
-    // Trigger a browser download on the receiving side
-    const blob = new Blob([decompressed], { type: meta.fileType || "application/octet-stream" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = meta.filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-
-    logMessage(
-      `✅ "${meta.filename}" (${formatSize(decompressed.byteLength)}) received and downloaded!`,
-      "system"
-    );
+    const handle = await showSaveFilePicker({
+      suggestedName: incomingFileMeta.filename,
+      _preferredMethods: ["native", "sw-transferable-stream", "sw-message-channel"]
+    });
+    incomingWritable = await handle.createWritable();
+    useStreamingSave = true;
+    logMessage(`💾 Streaming "${incomingFileMeta.filename}" directly to disk...`, "system");
   } catch (err) {
-    logMessage(`❌ Error receiving "${meta.filename}": ${err.message}`, "system");
-    console.error(err);
+    if (err.name === "AbortError") {
+      // User dismissed the native save dialog (Chrome/Edge) — cancel transfer
+      dataChannel.send(JSON.stringify({ type: "file-cancel" }));
+      incomingFileMeta = null;
+      return;
+    }
+    // All streaming methods unavailable — fall back to in-memory accumulation
+    incomingChunks = [];
+    useStreamingSave = false;
+    logMessage(`⚠️ Streaming unavailable (${err.message}) — receiving into memory. Very large files may fail.`, "system");
+  }
+
+  showTransferProgress("receive", incomingFileMeta.filename, incomingFileMeta.size);
+  dataChannel.send(JSON.stringify({ type: "file-accept" }));
+}
+
+// ── declineIncomingFile — called by the "Decline" button ─────────────────────
+function declineIncomingFile() {
+  if (!incomingFileMeta) return;
+  hideIncomingFileUI();
+  dataChannel.send(JSON.stringify({ type: "file-cancel" }));
+  logMessage(`❌ Declined "${incomingFileMeta.filename}"`, "system");
+  incomingFileMeta = null;
+}
+
+// ── receiveFile — called when the last byte of a transfer arrives ─────────────
+async function receiveFile() {
+  const meta    = incomingFileMeta;
+  const chunks  = incomingChunks;
+  const writable = incomingWritable;
+  const wasStreaming = useStreamingSave;
+
+  // Reset state so the next transfer can start immediately
+  incomingFileMeta      = null;
+  incomingChunks        = [];
+  incomingWritable      = null;
+  incomingBytesReceived = 0;
+  useStreamingSave      = false;
+
+  hideTransferProgress();
+
+  if (wasStreaming && writable) {
+    // ── Streaming path: just close the writable — data is already on disk ──
+    try {
+      await writable.close();
+      logMessage(`✅ "${meta.filename}" (${formatSize(meta.size)}) saved to disk!`, "system");
+    } catch (err) {
+      logMessage(`❌ Error finalising "${meta.filename}": ${err.message}`, "system");
+      console.error(err);
+    }
+  } else {
+    // ── In-memory fallback: assemble chunks → Blob → download link ─────────
+    try {
+      const totalLength = chunks.reduce((sum, c) => sum + c.byteLength, 0);
+      const merged = new Uint8Array(totalLength);
+      let offset = 0;
+      for (const chunk of chunks) {
+        merged.set(new Uint8Array(chunk), offset);
+        offset += chunk.byteLength;
+      }
+
+      const blob = new Blob([merged], { type: meta.fileType || "application/octet-stream" });
+      const url  = URL.createObjectURL(blob);
+      const a    = document.createElement("a");
+      a.href     = url;
+      a.download = meta.filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+
+      logMessage(`✅ "${meta.filename}" (${formatSize(meta.size)}) received and downloaded!`, "system");
+    } catch (err) {
+      logMessage(`❌ Error saving "${meta.filename}": ${err.message}`, "system");
+      console.error(err);
+    }
   }
 }
 
+// ── sendFile ──────────────────────────────────────────────────────────────────
+// Streams the file to the peer in CHUNK_SIZE slices without ever loading the
+// whole file into memory, supporting files of any size (5 GB+).
 async function sendFile() {
   const file = fileInput.files[0];
   if (!file || !dataChannel || dataChannel.readyState !== "open") return;
 
-  // Disable controls during transfer
   sendFileBtn.disabled = true;
-  fileInput.disabled = true;
+  fileInput.disabled   = true;
 
   try {
-    logMessage(`📤 Compressing "${file.name}" (${formatSize(file.size)})...`, "system");
-    const arrayBuffer = await file.arrayBuffer();
-    const compressed = await compressData(arrayBuffer);
-
-    // 1. Send metadata so the receiver knows what is coming
-    const meta = {
-      type: "file-meta",
+    // 1. Advertise the file — receiver shows an Accept / Decline prompt
+    dataChannel.send(JSON.stringify({
+      type:     "file-meta",
       filename: file.name,
       fileType: file.type,
-      compressedSize: compressed.byteLength
+      size:     file.size
+    }));
+    logMessage(`📤 Offering "${file.name}" (${formatSize(file.size)}) — waiting for peer to accept…`, "system");
+
+    // 2. Wait for the receiver to accept (or reject) via the handshake message
+    await new Promise((resolve, reject) => {
+      pendingFileAcceptResolve = resolve;
+      pendingFileAcceptReject  = reject;
+    });
+
+    showTransferProgress("send", file.name, file.size);
+    logMessage(`Sending "${file.name}" (${formatSize(file.size)})…`, "self");
+
+    // 3. Use bufferedAmountLowThreshold for efficient, event-driven backpressure
+    //    instead of polling with setTimeout.
+    dataChannel.bufferedAmountLowThreshold = BUFFER_LOW_THRESHOLD;
+    let drainResolve = null;
+    dataChannel.onbufferedamountlow = () => {
+      if (drainResolve) { drainResolve(); drainResolve = null; }
     };
-    dataChannel.send(JSON.stringify(meta));
 
-    logMessage(
-      `Sending "${file.name}" (${formatSize(compressed.byteLength)} compressed)...`,
-      "self"
-    );
-
-    // 2. Send compressed data in 64 KB chunks with basic backpressure
+    // 4. Stream the file one slice at a time — only CHUNK_SIZE bytes in RAM at once
     let offset = 0;
-    let lastLoggedSendPercent = 0;
-    const totalSize = compressed.byteLength;
 
-    while (offset < totalSize) {
-      // Pause when the send buffer is filling up
-      if (dataChannel.bufferedAmount > CHUNK_SIZE * 8) {
-        await new Promise(r => setTimeout(r, 50));
-        continue;
+    while (offset < file.size) {
+      // Apply backpressure: wait for the send buffer to drain before writing more
+      if (dataChannel.bufferedAmount > BUFFER_HIGH_THRESHOLD) {
+        await new Promise(r => { drainResolve = r; });
       }
 
-      const end = Math.min(offset + CHUNK_SIZE, totalSize);
-      dataChannel.send(compressed.slice(offset, end));
-      offset = end;
+      const slice  = file.slice(offset, Math.min(offset + CHUNK_SIZE, file.size));
+      const buffer = await slice.arrayBuffer();
+      dataChannel.send(buffer);
+      offset += buffer.byteLength;
 
-      // Log progress at 25 % milestones
-      const progress = Math.floor((offset / totalSize) * 100);
-      const milestone = Math.floor(progress / 25) * 25;
-      if (milestone > lastLoggedSendPercent && milestone < 100) {
-        logMessage(`Sending "${file.name}": ${milestone}%`, "system");
-        lastLoggedSendPercent = milestone;
-      }
+      updateTransferProgress(offset, file.size);
 
-      // Yield to the event loop between chunks for smoother UI
-      if (offset < totalSize) {
-        await new Promise(r => setTimeout(r, 0));
-      }
+      // Yield so the browser can process other events (UI stays responsive)
+      await new Promise(r => setTimeout(r, 0));
     }
 
+    dataChannel.onbufferedamountlow = null;
+    hideTransferProgress();
     logMessage(`✅ "${file.name}" sent successfully!`, "self");
+
   } catch (err) {
-    logMessage(`❌ Error sending file: ${err.message}`, "system");
+    hideTransferProgress();
+    logMessage(`❌ Error sending "${file.name}": ${err.message}`, "system");
     console.error(err);
+    pendingFileAcceptResolve = null;
+    pendingFileAcceptReject  = null;
   }
 
-  fileInput.value = "";
+  fileInput.value      = "";
   sendFileBtn.disabled = false;
-  fileInput.disabled = false;
+  fileInput.disabled   = false;
 }
 
 async function makeOffer() {
@@ -419,4 +533,12 @@ messageInput.addEventListener("keydown", (event) => {
 
 sendFileBtn.addEventListener("click", () => {
   sendFile();
+});
+
+document.getElementById("acceptFileBtn").addEventListener("click", () => {
+  acceptIncomingFile();
+});
+
+document.getElementById("declineFileBtn").addEventListener("click", () => {
+  declineIncomingFile();
 });
