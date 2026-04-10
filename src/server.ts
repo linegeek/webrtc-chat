@@ -1,36 +1,44 @@
-const express = require("express");
-const http = require("http");
-const WebSocket = require("ws");
-const path = require("path");
+import express from "express";
+import http from "http";
+import { WebSocketServer, WebSocket } from "ws";
+import path from "path";
+
+interface ClientMessage {
+  type: string;
+  roomId?: string;
+  [key: string]: unknown;
+}
 
 const app = express();
-app.use(express.static(path.join(__dirname, "public")));
+app.use(express.static(path.join(__dirname, "../public")));
 
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocketServer({ server });
 
-const rooms = new Map();
+const rooms = new Map<string, WebSocket[]>();
 
-wss.on("connection", (ws) => {
-  let currentRoom = null;
+wss.on("connection", (ws: WebSocket) => {
+  let currentRoom: string | null = null;
 
-  ws.on("message", (message) => {
-    let data;
+  ws.on("message", (message: Buffer | string) => {
+    let data: ClientMessage;
     try {
-      data = JSON.parse(message);
+      data = JSON.parse(message.toString()) as ClientMessage;
     } catch {
       return;
     }
 
     if (data.type === "join") {
       const roomId = data.roomId;
+      if (!roomId) return;
+
       currentRoom = roomId;
 
       if (!rooms.has(roomId)) {
         rooms.set(roomId, []);
       }
 
-      const clients = rooms.get(roomId);
+      const clients = rooms.get(roomId)!;
       clients.push(ws);
 
       if (clients.length > 2) {
@@ -53,7 +61,7 @@ wss.on("connection", (ws) => {
 
     if (!currentRoom || !rooms.has(currentRoom)) return;
 
-    const clients = rooms.get(currentRoom);
+    const clients = rooms.get(currentRoom)!;
     for (const client of clients) {
       if (client !== ws && client.readyState === WebSocket.OPEN) {
         client.send(JSON.stringify(data));
@@ -64,7 +72,7 @@ wss.on("connection", (ws) => {
   ws.on("close", () => {
     if (!currentRoom || !rooms.has(currentRoom)) return;
 
-    const clients = rooms.get(currentRoom).filter((client) => client !== ws);
+    const clients = rooms.get(currentRoom)!.filter((client) => client !== ws);
 
     if (clients.length === 0) {
       rooms.delete(currentRoom);
