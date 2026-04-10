@@ -10,7 +10,10 @@ interface ClientMessage {
 }
 
 const app = express();
-app.use(express.static(path.join(__dirname, "../public")));
+// Serve the compiled Vue frontend from frontend/dist (built by `npm run build:frontend`).
+// The dist directory contains sw.js (copied from frontend/public by Vite), so
+// the service worker path /sw.js resolves correctly for all browsers.
+app.use(express.static(path.join(__dirname, "../frontend/dist")));
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
