@@ -360,7 +360,8 @@ export function useWebRTC() {
 
   // ── joinRoom — opens WebSocket to signaling server and drives the protocol ───
   function joinRoom(roomId: string) {
-    socket = new WebSocket(`ws://${window.location.host}`)
+    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    socket = new WebSocket(`${wsProtocol}//${window.location.host}`)
 
     socket.onopen = () => {
       socket!.send(JSON.stringify({ type: 'join', roomId }))
