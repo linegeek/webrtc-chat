@@ -80,44 +80,44 @@
     }
     #transferProgress {
       display: none;
-      border: 1px solid #ddd;
-      border-radius: 8px;
-      padding: 12px 16px;
-      margin-bottom: 12px;
-      background: #fafafa;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 8px;
     }
     #transferProgressLabel {
       font-weight: bold;
-      font-size: 14px;
-      margin-bottom: 8px;
+      font-size: 13px;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
+      max-width: 30%;
+      flex-shrink: 0;
     }
     #transferProgressBar {
-      width: 100%;
-      height: 14px;
-      border-radius: 4px;
-      margin-bottom: 4px;
+      flex: 1;
+      height: 4px;
+      border-radius: 2px;
       appearance: none;
       -webkit-appearance: none;
       border: none;
     }
     #transferProgressBar::-webkit-progress-bar {
       background: #e0e0e0;
-      border-radius: 4px;
+      border-radius: 2px;
     }
     #transferProgressBar::-webkit-progress-value {
       background: #4a9eff;
-      border-radius: 4px;
+      border-radius: 2px;
     }
     #transferProgressBar::-moz-progress-bar {
       background: #4a9eff;
-      border-radius: 4px;
+      border-radius: 2px;
     }
     #transferProgressText {
       font-size: 12px;
       color: #555;
+      white-space: nowrap;
+      flex-shrink: 0;
     }
   </style>
 </head>
@@ -133,11 +133,6 @@
   <div id="messages"></div>
 
   <div class="row">
-    <input id="messageInput" type="text" placeholder="Type a message" disabled />
-    <button id="sendBtn" disabled>Send</button>
-  </div>
-
-  <div class="row">
     <input type="file" id="fileInput" disabled />
     <button id="sendFileBtn" disabled>Send File</button>
   </div>
@@ -146,6 +141,11 @@
     <div id="transferProgressLabel"></div>
     <progress id="transferProgressBar" value="0" max="100"></progress>
     <div id="transferProgressText"></div>
+  </div>
+
+  <div class="row">
+    <input id="messageInput" type="text" placeholder="Type a message" disabled />
+    <button id="sendBtn" disabled>Send</button>
   </div>
 
   <div id="incomingFileUI">

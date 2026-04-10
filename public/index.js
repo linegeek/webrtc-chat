@@ -201,7 +201,7 @@ function showTransferProgress(direction, filename, total) {
   progressBar.value         = 0;
   progressBar.max           = total;
   progressText.textContent  = `0% · 0 B of ${formatSize(total)}`;
-  progressEl.style.display  = "block";
+  progressEl.style.display  = "flex";
   transferStartTime  = Date.now();
   lastProgressUpdate = 0;
 }

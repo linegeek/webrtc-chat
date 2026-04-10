@@ -77,17 +77,6 @@
       </template>
     </Dialog>
 
-    <!-- ── Transfer progress (sits between header and log) ─────────────────────── -->
-    <div v-if="transferProgress.visible" class="px-4 pt-3 flex-shrink-0">
-      <div class="p-3 border-round-lg border-1 surface-border surface-card">
-        <div class="text-sm font-semibold mb-2 white-space-nowrap overflow-hidden text-overflow-ellipsis">
-          {{ transferProgress.label }}
-        </div>
-        <ProgressBar :value="progressPercent" style="height: 8px" class="mb-2" />
-        <div class="text-xs text-color-secondary">{{ transferProgress.text }}</div>
-      </div>
-    </div>
-
     <!-- ── Message log ──────────────────────────────────────────────────────────── -->
     <div ref="messagesEl" class="message-log">
       <template v-for="(msg, i) in messages" :key="i">
@@ -122,6 +111,17 @@
       <!-- Sending indicator — appears above the input bar when active -->
       <div v-if="isSendingFile" class="flex justify-content-center pb-1">
         <Tag value="Sending file…" severity="warn" />
+      </div>
+
+      <!-- Transfer progress — compact single-line bar just above the input pill -->
+      <div v-if="transferProgress.visible" class="flex align-items-center gap-3 pb-2 px-1">
+        <span class="text-sm font-semibold white-space-nowrap transfer-label">
+          {{ transferProgress.label }}
+        </span>
+        <div class="flex-1">
+          <ProgressBar :value="progressPercent" style="height: 4px" />
+        </div>
+        <span class="text-xs text-color-secondary white-space-nowrap">{{ transferProgress.text }}</span>
       </div>
 
       <!-- Input bar: [attach] [textarea] [send] -->
@@ -398,6 +398,13 @@ async function onFileInputChange(event: Event) {
 /* Remove the focus ring PrimeVue normally adds */
 .chat-textarea:focus {
   box-shadow: none !important;
+}
+
+/* ── Transfer progress label — constrained so it never crowds the bar ─── */
+.transfer-label {
+  max-width: 30%;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* ── Attachment button — icon-only, transparent ───────────────────────── */
