@@ -1,29 +1,13 @@
 import { ref, reactive, onUnmounted } from 'vue'
 import { showSaveFilePicker } from 'native-file-system-adapter'
+import type { Message, TransferProgress } from './webrtcTypes'
+import { CHUNK_SIZE, BUFFER_HIGH_THRESHOLD, BUFFER_LOW_THRESHOLD, RTC_CONFIG } from './webrtcConstants'
+import { formatSize, registerServiceWorker } from './webrtcUtils'
 
-// ── Types ─────────────────────────────────────────────────────────────────────
-export interface Message {
-  text: string
-  type: 'self' | 'peer' | 'system'
-}
-
-// ── Constants ─────────────────────────────────────────────────────────────────
-const CHUNK_SIZE            = 64  * 1024         // 64 KB — safe for all browsers
-const BUFFER_HIGH_THRESHOLD = 4   * 1024 * 1024  // pause sending above 4 MB
-const BUFFER_LOW_THRESHOLD  = 1   * 1024 * 1024  // resume sending below 1 MB
-
-const rtcConfig: RTCConfiguration = {
-  iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
-}
-
-// Register the service worker once (outside the composable so it only runs once)
-if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator) {
-  navigator.serviceWorker.register('/sw.js').catch((err) => {
-    console.warn('SW registration failed — streaming fallback may buffer in RAM:', err)
-  })
-}
+export type { Message, TransferProgress }
 
 export function useWebRTC() {
+  registerServiceWorker()
   // ── Reactive UI state ───────────────────────────────────────────────────────
   const status        = ref('Not connected')
   const messages      = ref<Message[]>([])
@@ -60,14 +44,6 @@ export function useWebRTC() {
   // Progress-bar throttle
   let transferStartTime  = 0
   let lastProgressUpdate = 0
-
-  // ── Utility helpers ──────────────────────────────────────────────────────────
-  function formatSize(bytes: number): string {
-    if (bytes < 1024)               return `${bytes} B`
-    if (bytes < 1024 * 1024)        return `${(bytes / 1024).toFixed(1)} KB`
-    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
-    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`
-  }
 
   function logMessage(text: string, type: Message['type'] = 'system') {
     messages.value.push({ text, type })
@@ -113,7 +89,7 @@ export function useWebRTC() {
 
   // ── RTCPeerConnection ────────────────────────────────────────────────────────
   function createPeerConnection() {
-    pc = new RTCPeerConnection(rtcConfig)
+    pc = new RTCPeerConnection(RTC_CONFIG)
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
